@@ -1,6 +1,7 @@
 import { useState } from "react";
 import "./App.css";
 import JavaEditor from "./Editor.jsx";
+import CodeEditor from "./CodeEditor.jsx";
 
 function App() {
   return (
@@ -35,7 +36,7 @@ function App() {
           Java Code Editor
         </h2>
 
-        <JavaEditor />
+        <CodeEditor />
       </div>
     </div>
   );

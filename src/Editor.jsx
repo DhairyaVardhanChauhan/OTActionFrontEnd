@@ -1,18 +1,35 @@
-import React, { useState, useRef, useEffect } from "react";
+/***********************************************************************
+ * Complete Multi-User Collaborative Editor
+ * With:
+ *  - Operational Transformation (OT)
+ *  - Cursor Transformation
+ *  - Multi-user colored cursors
+ *  - Correct row/col tracking
+ *  - No cursor jumping
+ *  - SockJS fix for Vite
+ ***********************************************************************/
+
+import React, { useState, useEffect, useRef } from "react";
 import Editor from "react-simple-code-editor";
 import Prism from "prismjs";
-
 import { Client } from "@stomp/stompjs";
 
 import "prismjs/components/prism-java";
 import "prismjs/themes/prism-tomorrow.css";
 
-// Lazy load SockJS after setting up global
-let SockJS = null;
+// ---- FIX Vite global issue ----
+window.global = window;
 
-// ------------------------------------------------------------
-// OT OPERATION CLASS
-// ------------------------------------------------------------
+// ---- SockJS Import ----
+import SockJS from "sockjs-client";
+
+if (typeof window.global === "undefined") {
+  window.global = window;
+}
+
+/******************************
+ * OT Operation Class
+ ******************************/
 class TextOperation {
   constructor() {
     this.ops = [];
@@ -28,7 +45,7 @@ class TextOperation {
     return this;
   }
   insert(str) {
-    if (str.length > 0) {
+    if (typeof str === "string" && str.length > 0) {
       this.ops.push(str);
       this.targetLength += str.length;
     }
@@ -43,10 +60,15 @@ class TextOperation {
   }
 }
 
+
+
+/******************************
+ * Generate a minimal OT patch
+ ******************************/
 function generateOp(oldText, newText) {
   const op = new TextOperation();
-
   let start = 0;
+
   while (
     start < oldText.length &&
     start < newText.length &&
@@ -70,153 +92,352 @@ function generateOp(oldText, newText) {
   const retainLen = start;
   const deleteLen = oldEnd - start + 1;
   const insertStr = newText.slice(start, newEnd + 1);
-  const retainTail = oldText.length - (oldEnd + 1);
 
   op.retain(retainLen);
   if (deleteLen > 0) op.delete(deleteLen);
   if (insertStr.length > 0) op.insert(insertStr);
-  op.retain(retainTail);
+  op.retain(oldText.length - (oldEnd + 1));
 
   return op;
 }
 
-// Apply operation to text
+
+
+/******************************
+ * Apply OT to string
+ ******************************/
 function applyOp(text, ops) {
-  let result = "";
+  let newText = "";
   let index = 0;
 
   for (const op of ops) {
     if (typeof op === "number") {
       if (op > 0) {
-        // Retain
-        result += text.slice(index, index + op);
+        newText += text.slice(index, index + op);
         index += op;
       } else {
-        // Delete
-        index += Math.abs(op);
+        index += -op;
       }
     } else {
-      // Insert
-      result += op;
+      newText += op;
     }
   }
 
-  return result;
+  return newText;
 }
 
-// ========================================================
-// MAIN COMPONENT
-// ========================================================
-const JavaEditor = () => {
-  const [code, setCode] = useState(`public class Main {
-    public static void main(String[] args) {
-        System.out.println("Hello!");
+
+
+/******************************
+ * Transform cursor based on OT
+ ******************************/
+function transformCursorPosition(index, operation) {
+  let newIndex = index;
+  let pos = 0;
+
+  for (const op of operation.ops) {
+    if (typeof op === "number") {
+      if (op > 0) {
+        pos += op; // retain
+      } else {
+        const delLen = -op;
+        if (newIndex > pos && newIndex <= pos + delLen) {
+          newIndex = pos;
+        } else if (newIndex > pos + delLen) {
+          newIndex -= delLen;
+        }
+        pos += delLen;
+      }
+    } else {
+      const insLen = op.length;
+      if (newIndex >= pos) {
+        newIndex += insLen;
+      }
+      pos += insLen;
     }
-}`);
-  const prev = useRef(code);
+  }
 
-  const clientId = useRef(`client-${Math.random().toString(36).substr(2, 9)}`);
-  const sessionId = "session1";
-  const documentId = "docA";
+  return newIndex;
+}
 
+
+
+/******************************
+ * Index <-> Row/Col conversions
+ ******************************/
+function rowColToIndex(text, row, col) {
+  const lines = text.split("\n");
+  let index = 0;
+
+  for (let i = 0; i < row - 1; i++) {
+    index += lines[i].length + 1;
+  }
+
+  return index + (col - 1);
+}
+
+function indexToRowCol(text, index) {
+  const lines = text.slice(0, index).split("\n");
+  return {
+    row: lines.length,
+    col: lines[lines.length - 1].length + 1,
+  };
+}
+
+
+
+/******************************
+ * Pixel Position of Cursor
+ ******************************/
+function getCursorXY(editorEl, row, col) {
+  const pre = editorEl.querySelector("pre");
+  if (!pre) return { x: 0, y: 0, lineHeight: 20 };
+
+  const lines = pre.innerText.split("\n");
+  const lineText = lines[row - 1] ?? "";
+  const beforeText = lineText.slice(0, col - 1);
+
+  const temp = document.createElement("span");
+  temp.style.visibility = "hidden";
+  temp.style.whiteSpace = "pre";
+  temp.style.font = getComputedStyle(pre).font;
+  temp.textContent = beforeText === "" ? " " : beforeText;
+
+  pre.appendChild(temp);
+  const width = temp.offsetWidth;
+  pre.removeChild(temp);
+
+  const lineHeight = parseFloat(getComputedStyle(pre).lineHeight || "20");
+  const yOffset = (row - 1) * lineHeight;
+
+  const editorRect = editorEl.getBoundingClientRect();
+  const preRect = pre.getBoundingClientRect();
+
+  const scrollTop = editorEl.scrollTop;
+  const scrollLeft = editorEl.scrollLeft;
+
+  const x = preRect.left - editorRect.left + width - scrollLeft;
+  const y = preRect.top - editorRect.top + yOffset - scrollTop;
+
+  return { x, y, lineHeight };
+}
+
+
+
+/******************************
+ * Remote Cursor Overlay
+ ******************************/
+const RemoteCursorOverlay = ({ editorRef, remoteCursors, userColors }) => {
+  const [positions, setPositions] = useState({});
+
+  useEffect(() => {
+    const el = editorRef.current;
+    if (!el) return;
+
+    const newPositions = {};
+    Object.keys(remoteCursors).forEach((cid) => {
+      const cur = remoteCursors[cid];
+      const pos = getCursorXY(el, cur.row, cur.col);
+      newPositions[cid] = pos;
+    });
+
+    setPositions(newPositions);
+  }, [remoteCursors]);
+
+  return (
+    <>
+      {Object.keys(remoteCursors).map((cid) => {
+        const cur = remoteCursors[cid];
+        const pos = positions[cid];
+        if (!pos) return null;
+
+        const color = userColors[cid];
+
+        return (
+          <div key={cid} style={{ pointerEvents: "none", position: "absolute" }}>
+            {/* caret */}
+            <div
+              style={{
+                position: "absolute",
+                left: pos.x,
+                top: pos.y,
+                width: 2,
+                height: pos.lineHeight,
+                background: color,
+                zIndex: 99,
+              }}
+            />
+            {/* name tag */}
+            <div
+              style={{
+                position: "absolute",
+                left: pos.x + 5,
+                top: pos.y - 16,
+                background: color,
+                color: "#000",
+                padding: "2px 6px",
+                borderRadius: 3,
+                fontSize: 11,
+                fontWeight: "bold",
+                zIndex: 100,
+              }}
+            >
+              {cur.name}
+            </div>
+          </div>
+        );
+      })}
+    </>
+  );
+};
+
+
+
+/******************************
+ * MAIN EDITOR COMPONENT
+ ******************************/
+const CodeEditor = () => {
+  const [code, setCode] = useState("");
+  const prev = useRef("");
+
+  const clientId = useRef(`client-${Math.random().toString(36).slice(2, 9)}`);
   const revision = useRef(0);
   const stompClient = useRef(null);
+
   const [connected, setConnected] = useState(false);
+  const editorRef = useRef(null);
 
-  // -----------------------------------------------------
-  // CONNECT TO SPRING BOOT + STOMP
-  // -----------------------------------------------------
+  const [remoteCursors, setRemoteCursors] = useState({});
+  const [userColors, setUserColors] = useState({});
+
+  const getDisplayName = (p) =>
+    p?.name || p?.username || p?.clientId || "User";
+
+  function assignUserColor(cid) {
+    if (userColors[cid]) return userColors[cid];
+
+    const palette = ["#ff3860", "#00d1b2", "#ffdd57", "#7fdbff", "#ff7f50", "#c792ea"];
+    const color = palette[Math.floor(Math.random() * palette.length)];
+
+    setUserColors((prev) => ({ ...prev, [cid]: color }));
+    return color;
+  }
+
+
+
+  /********************************
+   * Connect STOMP + SockJS
+   ********************************/
   useEffect(() => {
-    // Set up global polyfill before loading SockJS
-    if (typeof window.global === "undefined") {
-      window.global = window;
-    }
+    const socket = new SockJS("http://localhost:8080/ws");
+    const client = new Client({
+      webSocketFactory: () => socket,
+      reconnectDelay: 300,
+      debug: (msg) => console.log(msg),
 
-    // Dynamically import SockJS after polyfill is set
-    import("sockjs-client")
-      .then((module) => {
-        SockJS = module.default;
+      onConnect: () => {
+        setConnected(true);
 
-        const socket = new SockJS("http://localhost:8080/ws");
+        /********************************
+         * Receive operations & cursors
+         ********************************/
+        client.subscribe("/topic/sessions", (message) => {
+          let payload;
 
-        const client = new Client({
-          webSocketFactory: () => socket,
-          reconnectDelay: 500,
-          debug: (str) => console.log(str),
+          try {
+            payload = JSON.parse(message.body);
+          } catch {
+            return;
+          }
 
-          onConnect: () => {
-            console.log("✅ STOMP Connected");
-            setConnected(true);
+          if (payload.clientId === clientId.current) return;
 
-            // Receive transformed ops from other clients
-            client.subscribe("/topic/sessions", (msg) => {
-              const payload = JSON.parse(msg.body);
+          const cid = payload.clientId;
 
-              if (payload.clientId !== clientId.current) {
-                console.log("📥 Remote OP:", payload.operation);
+          /********************************
+           * Apply remote OT operation
+           ********************************/
+          if (payload.operation) {
+            setCode((current) => {
+              const updated = applyOp(current, payload.operation);
 
-                // Apply remote operation
-                setCode((currentCode) => {
-                  const newCode = applyOp(currentCode, payload.operation);
-                  prev.current = newCode;
-                  return newCode;
+              // transform ALL remote cursors
+              setRemoteCursors((prevCur) => {
+                const newCur = {};
+
+                Object.keys(prevCur).forEach((c) => {
+                  const cur = prevCur[c];
+
+                  const oldIndex = rowColToIndex(current, cur.row, cur.col);
+                  const newIndex = transformCursorPosition(
+                    oldIndex,
+                    payload.operation
+                  );
+
+                  newCur[c] = {
+                    ...cur,
+                    ...indexToRowCol(updated, newIndex),
+                  };
                 });
-              }
+
+                return newCur;
+              });
+
+              prev.current = updated;
+              return updated;
             });
+          }
 
-            // Receive ACK for our operations
-            client.subscribe(`/topic/ack/${clientId.current}`, () => {
-              console.log("✅ ACK received");
-              revision.current += 1;
-            });
-          },
+          /********************************
+           * Update cursor of THAT client
+           ********************************/
+          if (payload.cursorPosition) {
+            const name = getDisplayName(payload);
+            const color = assignUserColor(cid);
 
-          onDisconnect: () => {
-            console.log("❌ STOMP Disconnected");
-            setConnected(false);
-          },
-
-          onStompError: (frame) => {
-            console.error("❌ STOMP Error:", frame);
-          },
+            setRemoteCursors((prev) => ({
+              ...prev,
+              [cid]: {
+                row: payload.cursorPosition.row,
+                col: payload.cursorPosition.col,
+                name,
+                color,
+              },
+            }));
+          }
         });
 
-        client.activate();
-        stompClient.current = client;
-      })
-      .catch((err) => {
-        console.error("Failed to load SockJS:", err);
-      });
+        client.subscribe(`/topic/ack/${clientId.current}`, () => {
+          revision.current += 1;
+        });
+      },
 
-    return () => {
-      if (stompClient.current) {
-        stompClient.current.deactivate();
-      }
-    };
+      onDisconnect: () => setConnected(false),
+      onStompError: () => setConnected(false),
+    });
+
+    client.activate();
+    stompClient.current = client;
+
+    return () => client.deactivate();
   }, []);
 
-  // -----------------------------------------------------
-  // SEND OT OPERATION
-  // -----------------------------------------------------
-  const sendOperation = (operation) => {
-    if (!stompClient.current || !stompClient.current.connected) {
-      console.warn("⚠️ STOMP not connected yet");
-      return;
-    }
+
+
+  /********************************
+   * Send OT + cursor
+   ********************************/
+  const sendOperation = (operation, cursorPos) => {
+    if (!stompClient.current || !stompClient.current.connected) return;
 
     const payload = {
       clientId: clientId.current,
-      documentId,
-      sessionId,
+      documentId: "docA",
+      sessionId: "session1",
       revision: revision.current,
       operation: operation.ops,
-      cursorPosition: {
-        line: 0,
-        column: 0,
-      },
+      cursorPosition: cursorPos,
     };
-
-    console.log("📤 Sending:", payload);
 
     stompClient.current.publish({
       destination: "/app/operation",
@@ -224,74 +445,82 @@ const JavaEditor = () => {
     });
   };
 
-  // -----------------------------------------------------
-  // HANDLE LOCAL EDITS
-  // -----------------------------------------------------
-  const handleChange = (newValue) => {
-    const oldValue = prev.current;
 
-    const op = generateOp(oldValue, newValue);
-    console.log("✏️ Generated OT op:", op.ops);
 
-    sendOperation(op);
+  /********************************
+   * Local editing handler
+   ********************************/
+  const handleChange = (newCode) => {
+    const op = generateOp(prev.current, newCode);
 
-    setCode(newValue);
-    prev.current = newValue;
+    const textarea = editorRef.current.querySelector("textarea");
+    const index = textarea?.selectionStart ?? newCode.length;
+    const { row, col } = indexToRowCol(newCode, index);
+
+    sendOperation(op, { row, col });
+
+    prev.current = newCode;
+    setCode(newCode);
   };
 
+
+
+  /********************************
+   * Render UI
+   ********************************/
   return (
-    <div style={{ padding: "20px", background: "#0d1117", minHeight: "100vh" }}>
-      <div
-        style={{
-          marginBottom: "10px",
-          color: "#fff",
-          display: "flex",
-          alignItems: "center",
-          gap: "10px",
-        }}
-      >
+    <div style={{ background: "#0d1117", minHeight: "100vh", padding: 20 }}>
+      <div style={{ color: "#fff", marginBottom: 10 }}>
         <span
           style={{
             display: "inline-block",
-            width: "10px",
-            height: "10px",
+            width: 10,
+            height: 10,
             borderRadius: "50%",
             background: connected ? "#00ff00" : "#ff0000",
+            marginRight: 10,
           }}
         />
-        <span>
-          {connected ? "Connected" : "Disconnected"} | Client:{" "}
-          {clientId.current}
-        </span>
+        {connected ? "Connected" : "Disconnected"} — {clientId.current}
       </div>
 
       <div
+        ref={editorRef}
         style={{
+          position: "relative",
           background: "#1e1e1e",
-          borderRadius: "10px",
-          padding: "10px",
+          padding: 10,
+          borderRadius: 8,
           border: "1px solid #333",
-          maxWidth: "800px",
+          maxWidth: 800,
+          overflow: "auto",
         }}
       >
         <Editor
           value={code}
           onValueChange={handleChange}
+          padding={12}
           highlight={(code) =>
             Prism.highlight(code, Prism.languages.java, "java")
           }
-          padding={12}
           style={{
             fontFamily: "monospace",
             fontSize: 14,
-            minHeight: 250,
             outline: "none",
             color: "#fff",
+            minHeight: 260,
+            whiteSpace: "pre",
           }}
+        />
+
+        <RemoteCursorOverlay
+          editorRef={editorRef}
+          remoteCursors={remoteCursors}
+          userColors={userColors}
         />
       </div>
     </div>
   );
 };
 
-export default JavaEditor;
+export default CodeEditor;

@@ -40,3 +40,13 @@
 .read-the-docs {
   color: #888;
 }
+
+
+.remote-cursor {
+  position: absolute;
+  width: 2px;
+  background: red;
+  height: 1.2em;
+  pointer-events: none;
+  z-index: 100;
+}
