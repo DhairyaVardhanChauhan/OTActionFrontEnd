@@ -10,7 +10,7 @@ import "prismjs/themes/prism-tomorrow.css";
 let SockJS = null;
 
 /* ============================================================
-   TextOperation - faithful conversion of your TypeScript class special thanks to ot.js for inspiration :)
+   TextOperation - special thanks to ot.js for inspiration :)
    ============================================================ */
 class TextOperation {
   constructor() {
