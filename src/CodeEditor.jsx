@@ -174,7 +174,7 @@ class TextOperation {
             `Cannot invert delete (${-op}) starting past end of document (${str.length}) at index ${strIndex}. Original Op: ${this.toString()}`
           );
         }
-        const endIndex = Math.min(strIndex - op, str.length); // strIndex - op = strIndex + (-op)
+        const endIndex = Math.min(strIndex - op, str.length); // strIndex - op = strIndex + (-op) 
         inverse.insert(str.slice(strIndex, endIndex));
         strIndex -= op;
       }
@@ -289,8 +289,12 @@ class TextOperation {
     return operation;
   }
 
-  // transform: static method - returns [operation1prime, operation2prime]
-  // This is the same algorithm you requested (translation of your Java)
+  // transform: static method - returns [operation1prime, operation2prime] ( for those who are new to OT,s
+  // this is the most confusion function, even i was tired wrapping my head on it essentially if you have two
+  // concurrent operations op1 and op2 you can transform them into op1' and op2' such that
+  // applying op1 then op2' is the same as applying op2 then op1' 
+  // i.e op1 + op2' = op2 + op1'
+  // or i read it like how would operation op1 look like if op2 has already been applied to the document)
   static transform(operation1, operation2) {
     const operation1prime = new TextOperation();
     const operation2prime = new TextOperation();
@@ -342,8 +346,8 @@ class TextOperation {
         operation1prime.retain(minLength);
         operation2prime.retain(minLength);
       } else if (TextOperation.isDelete(op1) && TextOperation.isDelete(op2)) {
-        let d1 = op1; // negative
-        let d2 = op2; // negative
+        let d1 = op1;
+        let d2 = op2;
         if (-d1 > -d2) {
           op1 = d1 - d2;
           op2 = ops2[i2++];
